@@ -1,13 +1,5 @@
 using Base: RefValue
-
-if VERSION > v"1.7.0-DEV.204"
-  using Base: ismutabletype
-else
-  function ismutabletype(@nospecialize(t::Type))
-    t = Base.unwrap_unionall(t)
-    return isa(t, DataType) && t.mutable
-  end
-end
+using Base: ismutabletype
 
 # Interfaces
 
@@ -19,10 +11,32 @@ accum(x, y) =
   y === nothing ? x :
   x + y
 
-accum(x, y, zs...) = accum(accum(x, y), zs...)
+# Unrolled because `map` over tuples of ≥ 32 elements and splats of ≥ 33 arguments are not,
+# which made backward passes over long tuples quadratic and allocation-heavy.
+# The non-generated branches are what inference sees for non-concrete types.
+function accum(x, y, zs...)
+  if @generated
+    ex = :(accum(x, y))
+    for i in 1:length(zs)
+      ex = :(accum($ex, zs[$i]))
+    end
+    ex
+  else
+    accum(accum(x, y), zs...)
+  end
+end
 
-accum(x::Tuple, ys::Tuple...) = accum.(x, ys...)
-accum(x::AbstractArray, ys::AbstractArray...) = accum.(x, ys...)
+function accum(x::Tuple, y::Tuple)
+  if @generated
+    N = min(length(x.parameters), length(y.parameters))
+    Expr(:tuple, [:(accum(x[$i], y[$i])) for i in 1:N]...)
+  else
+    map(accum, x, y)
+  end
+end
+accum(x::AbstractArray, ys::AbstractArray...) = Base.broadcast_preserving_zero_d(accum, x, ys...)
+accum(::Tuple{}, ::NamedTuple{}) = ()
+accum(::NamedTuple{}, ::Tuple{}) = ()
 
 @generated function accum(x::NamedTuple, y::NamedTuple)
   # assumes that y has no keys apart from those also in x
@@ -36,20 +50,39 @@ function accum(x::RefValue, y::RefValue)
   @assert x === y
   return x
 end
+function accum(x::NamedTuple, ref::RefValue)
+    # We do not actually do any accumulation here, because the ref will already have been mutated.
+  fieldnames(typeof(ref[])) ⊆ fieldnames(typeof(x)) || throw(ArgumentError("$(ref[]) keys from Ref must be a subset of $x keys"))
+  ref
+end
+function accum(ref::RefValue, x::NamedTuple)
+    # We do not actually do any accumulation here, because the ref will already have been mutated.
+  fieldnames(typeof(x)) ⊆ fieldnames(typeof(ref[])) || throw(ArgumentError("$x keys must be a subset of $(ref[]) keys from Ref"))
+  ref
+end
+
+accum(x::NamedTuple, y::ChainRulesCore.Tangent) = accum(x, wrap_chainrules_output(y))
+accum(x::ChainRulesCore.Tangent, y::NamedTuple) = accum(wrap_chainrules_output(x), y)
+
+accum(x::Nothing, y::AbstractThunk) = y
+accum(x::AbstractThunk, y::Nothing) = x
+
+accum(x, y::AbstractThunk) = accum(x, unthunk(y))
+accum(x::AbstractThunk, y) = accum(unthunk(x), y)
+accum(x::AbstractThunk, y::AbstractThunk) = accum(unthunk(x), unthunk(y))
 
 # Core functions
-@nograd eps, Base.eval, Core.TypeVar, Core.UnionAll, Symbol
+@_adjoint_keepthunks deepcopy(x) = deepcopy(x), ȳ -> (ȳ,)
 
-@adjoint deepcopy(x) = deepcopy(x), ȳ -> (ȳ,)
+@_adjoint_keepthunks (::Type{V})(x...) where V<:Val = V(x...), _ -> nothing
 
-@adjoint (::Type{V})(x...) where V<:Val = V(x...), _ -> nothing
-
-@adjoint ifelse(cond::Bool, t, f) =
+@_adjoint_keepthunks ifelse(cond::Bool, t, f) =
   ifelse(cond, t, f),
   Δ -> cond ? (nothing, Δ, zero(Δ)) : (nothing, zero(Δ), Δ)
 
-@adjoint Base.typeassert(x, T) = Base.typeassert(x, T), Δ -> (Δ, nothing)
+@_adjoint_keepthunks Base.typeassert(x, T) = Base.typeassert(x, T), Δ -> (Δ, nothing)
 
+accum_param(::Context{false}, _, Δ) = Δ
 @generated function accum_param(cx::Context, x, Δ)
   isbitstype(x) && return :(Δ)
   quote
@@ -71,21 +104,20 @@ end
 
 unwrap(x) = x
 
-@adjoint unwrap(x) = unwrap(x), x̄ -> (accum_param(__context__, x, x̄),)
+@_adjoint_keepthunks unwrap(x) = unwrap(x), x̄ -> (accum_param(__context__, x, x̄),)
 
 unwrap(ref, x) = x
 
-@adjoint unwrap(ref, x) = unwrap(x), function (x̄)
+@_adjoint_keepthunks unwrap(ref, x) = unwrap(x), function (x̄)
   accum_global(__context__, ref, x̄)
   (accum_param(__context__, x, x̄),)
 end
 
 function global_set(ref, val)
-  ccall(:jl_set_global, Cvoid, (Any, Any, Any),
-        ref.mod, ref.name, val)
+    setglobal!(ref.mod, ref.name, val)
 end
 
-@adjoint! function global_set(ref, x)
+@_adjoint_keepthunks! function global_set(ref, x)
   global_set(ref, x), function (x̄)
     gs = cache(__context__)
     x̄ = accum(get(gs, ref, nothing), x̄)
@@ -98,9 +130,9 @@ end
 
 using Base: tail
 
-@adjoint tuple(xs...) = xs, identity
+@_adjoint_keepthunks tuple(xs...) = xs, identity
 
-@adjoint function literal_getindex(xs::NTuple{N,Any}, ::Val{i}) where {N,i}
+@_adjoint_keepthunks function literal_getindex(xs::NTuple{N,Any}, ::Val{i}) where {N,i}
   val = xs[i]
   function back(Δ)
     accum_param(__context__, val, Δ) === nothing && return
@@ -109,7 +141,7 @@ using Base: tail
   val, back
 end
 
-@adjoint function getindex(xs::NTuple{N,Any}, i::Integer) where N
+@_adjoint_keepthunks function getindex(xs::NTuple{N,Any}, i::Integer) where N
   val = xs[i]
   function back(Δ)
     accum_param(__context__, val, Δ) === nothing && return
@@ -118,10 +150,10 @@ end
   return val, back
 end
 
-@adjoint getindex(xs::NTuple{N,Any}, r::AbstractUnitRange) where N =
+@_adjoint_keepthunks getindex(xs::NTuple{N,Any}, r::AbstractUnitRange) where N =
   (xs[r], Δ -> (ntuple(j -> j in r ? Δ[findfirst(isequal(j), r)] : nothing, Val(N)), nothing))
 
-@adjoint function getindex(xs::NTuple{N,Any}, r::AbstractVector) where N
+@_adjoint_keepthunks function getindex(xs::NTuple{N,Any}, r::AbstractVector) where N
   val = xs[r]
   function back(Δ)
     dxs = ntuple(Val(length(xs))) do x
@@ -152,18 +184,18 @@ function _pullback(cx::AContext, ::typeof(literal_indexed_iterate), xs::Tuple, :
 end
 
 # Needed for iteration lowering
-@adjoint Core.getfield(xs::NTuple{N,Any}, i::Int) where N =
+@_adjoint_keepthunks Core.getfield(xs::NTuple{N,Any}, i::Int) where N =
   (xs[i], Δ -> (ntuple(j -> i == j ? Δ : nothing, Val(N)), nothing))
 
-@adjoint Core.getfield(xs::NamedTuple{K,<:NTuple{N,Any}}, i::Int) where {K,N} =
+@_adjoint_keepthunks Core.getfield(xs::NamedTuple{K,<:NTuple{N,Any}}, i::Int) where {K,N} =
   (xs[i], Δ -> (NamedTuple{K}(ntuple(j -> i == j ? Δ : nothing, Val(N))), nothing))
 
-@adjoint function Base.first(xs::Tuple)
+@_adjoint_keepthunks function Base.first(xs::Tuple)
   drest = map(_->nothing, tail(xs))
   first(xs), Δ -> ((Δ, drest...),)
 end
 
-@adjoint Base.tail(xs::Tuple) = tail(xs), x̄s -> ((nothing, x̄s...),)
+@_adjoint_keepthunks Base.tail(xs::Tuple) = tail(xs), x̄s -> ((nothing, x̄s...),)
 
 _empty(x) = length(x)
 _empty(x::Union{Tuple,NamedTuple}) = map(_->nothing, x)
@@ -185,7 +217,7 @@ end
 
 unapply(t, xs) = _unapply(t, xs)[1]
 
-@adjoint! function Core._apply(f, args...)
+@_adjoint_keepthunks! function Core._apply(f, args...)
   y, back = Core._apply(_pullback, (__context__, f), args...)
   st = map(_empty, args)
   y, function (Δ)
@@ -195,15 +227,13 @@ unapply(t, xs) = _unapply(t, xs)[1]
   end
 end
 
-if VERSION >= v"1.4.0-DEV.304"
-  @adjoint! function Core._apply_iterate(::typeof(iterate), f, args...)
-    y, back = Core._apply(_pullback, (__context__, f), args...)
-    st = map(_empty, args)
-    y, function (Δ)
-      Δ = back(Δ)
-      Δ === nothing ? nothing :
-        (nothing, first(Δ), unapply(st, Base.tail(Δ))...)
-    end
+@_adjoint_keepthunks! function Core._apply_iterate(::typeof(iterate), f, args...)
+  y, back = Core._apply(_pullback, (__context__, f), args...)
+  st = map(_empty, args)
+  y, function (Δ)
+    Δ = back(Δ)
+    Δ === nothing ? nothing :
+      (nothing, first(Δ), unapply(st, Base.tail(Δ))...)
   end
 end
 
@@ -222,7 +252,7 @@ end
 @generated pair(::Val{k}, v, _=nothing) where k = :($k = v,)
 @generated pair(::Val{k}, v, ::NamedTuple{keys}) where {k,keys} = k isa Int ? :($(getfield(keys, k)) = v,) : :($k = v,)
 
-@adjoint function literal_getfield(x, ::Val{f}) where f
+@_adjoint_keepthunks function literal_getfield(x, ::Val{f}) where f
   val = getfield(x, f)
   function back(Δ)
     accum_param(__context__, val, Δ) === nothing && return
@@ -240,6 +270,15 @@ end
 
 _pullback(cx::AContext, ::typeof(getfield), x, field_name::Symbol) =
   _pullback(cx, literal_getfield, x, Val(field_name))
+
+# Field access by a non-literal integer index (e.g. `ColorTypes._comp(Val{N}, c)`
+# lowers to `getfield(c, N)` with `N` a runtime `Int`). Convert the index to the
+# field *name* and reuse the `Symbol` path, so the tangent is built with a valid
+# field name rather than the bare integer. For a `Tuple`, `fieldname` returns the
+# integer itself, which routes on to `literal_getindex` as usual. (Literal-integer
+# `getfield` is already handled at IR level by `instrument_getfield!`.)
+_pullback(cx::AContext, ::typeof(getfield), x, i::Int) =
+  _pullback(cx, literal_getfield, x, Val(fieldname(typeof(x), i)))
 
 function _pullback(cx::AContext, ::typeof(literal_getproperty), x::NamedTuple,
                    ::Val{property_name}) where {property_name}
@@ -259,18 +298,40 @@ function _pullback(cx::AContext, ::typeof(literal_getfield), x::Tuple,
   return _pullback(cx, literal_getindex, x, Val(index))
 end
 
+# Reading a binding out of a `Module` is not differentiable: a module global is a
+# constant from AD's point of view, never a differentiable input. Without these
+# methods the source transform recurses through `getproperty(::Module, ::Symbol)`
+# into the `getglobal` builtin, which has no IR and no adjoint — historically
+# surfacing as a cryptic `UndefVarError: j` (issues #194, #252, #467, #619). The
+# `accum_param` call keeps the legacy implicit-`Params` mode working when the
+# binding's *value* (e.g. a qualified global array) is a tracked parameter.
+function _pullback(cx::AContext, ::typeof(literal_getproperty), m::Module,
+                   ::Val{property_name}) where {property_name}
+  val = getproperty(m, property_name)
+  module_getproperty_pullback(Δ) = (accum_param(cx, val, Δ); nothing)
+  return val, module_getproperty_pullback
+end
+function _pullback(cx::AContext, ::typeof(literal_getfield), m::Module,
+                   ::Val{field_name}) where {field_name}
+  val = getfield(m, field_name)
+  module_getfield_pullback(Δ) = (accum_param(cx, val, Δ); nothing)
+  return val, module_getfield_pullback
+end
+
 grad_mut(x) = Ref{Any}(nt_nothing(x))
 
-function grad_mut(cx::Context, x)
-  ch = cache(cx)
+grad_mut(cx::Context, x) = _get!(() -> grad_mut(x), cache(cx), x)
+
+# needed for reverse-over-reverse pending rrule for Base.get!
+function _get!(default::Base.Callable, ch, x)
   if haskey(ch, x)
     ch[x]
   else
-    ch[x] = grad_mut(x)
+    ch[x] = default()
   end
 end
 
-@adjoint! function setfield!(x, f, val)
+@_adjoint_keepthunks! function setfield!(x, f, val)
   y = setfield!(x, f, val)
   g = grad_mut(__context__, x)
   y, function (_)
@@ -286,13 +347,13 @@ end
 
 Jnew{T}(g) where T = Jnew{T,typeof(g)}(g)
 
-@adjoint! function __new__(T, args...)
+@_adjoint_keepthunks! function __new__(T, args...)
   x = __new__(T, args...)
   g = !ismutabletype(T) || fieldcount(T) == 0 ? nothing : grad_mut(__context__, x)
   x, Jnew{T,typeof(g),false}(g)
 end
 
-@adjoint! function __splatnew__(T, args)
+@_adjoint_keepthunks! function __splatnew__(T, args)
   x = __splatnew__(T, args)
   g = !ismutabletype(T) || fieldcount(T) == 0 ? nothing : grad_mut(__context__, x)
   x, Jnew{T,typeof(g),true}(g)

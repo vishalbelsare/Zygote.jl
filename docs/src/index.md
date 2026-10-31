@@ -1,6 +1,6 @@
 # Zygote
 
-Welcome! Zygote extends the Julia language to support [differentiable programming](https://fluxml.ai/blog/2019/02/07/what-is-differentiable-programming.html). With Zygote you can write down any Julia code you feel like – including using existing Julia packages – then get gradients and optimise your program. Deep learning, ML and probabilistic programming are all different kinds of differentiable programming that you can do with Zygote.
+Welcome! Zygote extends the Julia language to support [differentiable programming](https://fluxml.ai/blogposts/2019-02-07-what-is-differentiable-programming/). With Zygote you can write down any Julia code you feel like – including using existing Julia packages – then get gradients and optimise your program. Deep learning, ML and probabilistic programming are all different kinds of differentiable programming that you can do with Zygote.
 
 At least, that's the idea. We're still in beta so expect some adventures.
 
@@ -18,18 +18,18 @@ Zygote is easy to understand since, at its core, it has a one-function API (`pul
 
 `gradient` calculates derivatives. For example, the derivative of ``3x^2 + 2x + 1`` is ``6x + 2``, so when `x = 5`, `dx = 32`.
 
-```julia
+```jldoctest index
 julia> using Zygote
 
 julia> gradient(x -> 3x^2 + 2x + 1, 5)
-(32,)
+(32.0,)
 ```
 
 `gradient` returns a tuple, with a gradient for each argument to the function.
 
-```julia
+```jldoctest index
 julia> gradient((a, b) -> a*b, 2, 3)
-(3, 2)
+(3.0, 2.0)
 ```
 
 This will work equally well if the arguments are arrays, structs, or any other Julia type, but the function should return a scalar (like a loss or objective ``l``, if you're doing optimisation / ML).
@@ -48,7 +48,7 @@ julia> gradient(x -> 3x^2 + 2x + 1, 1//4)
 
 Control flow is fully supported, including recursion.
 
-```julia
+```jldoctest index
 julia> function pow(x, n)
          r = 1
          for i = 1:n
@@ -59,26 +59,26 @@ julia> function pow(x, n)
 pow (generic function with 1 method)
 
 julia> gradient(x -> pow(x, 3), 5)
-(75,)
+(75.0,)
 
 julia> pow2(x, n) = n <= 0 ? 1 : x*pow2(x, n-1)
 pow2 (generic function with 1 method)
 
 julia> gradient(x -> pow2(x, 3), 5)
-(75,)
+(75.0,)
 ```
 
 Data structures are also supported, including mutable ones like dictionaries. Arrays are currently immutable, though [this may change](https://github.com/FluxML/Zygote.jl/pull/75) in future.
 
-```julia
+```jldoctest index
 julia> d = Dict()
-Dict{Any,Any} with 0 entries
+Dict{Any, Any}()
 
 julia> gradient(5) do x
          d[:x] = x
          d[:x] * d[:x]
        end
-(10,)
+(10.0,)
 
 julia> d[:x]
 5
@@ -129,9 +129,13 @@ julia> gradient(colordiff, RGB(1, 0, 0), RGB(0, 1, 0))
 ((r = 0.4590887719632896, g = -9.598786801605689, b = 14.181383399012862), (r = -1.7697549557037275, g = 28.88472330558805, b = -0.044793892637761346))
 ```
 
-## Explicit and Implicit Parameters
+## Differentiating Models
 
-It's easy to work with even very large and complex models, and there are few ways to do this. Autograd-style models pass around a collection of weights. Depending on how you write your model, there are multiple ways to *explicity* take gradients with respect to parameters. For example, the function `linear` accepts the parameters as an argument to the model. So, we directly pass in the parameters, `θ`, as an argument to the function being differentiated.
+It's easy to work with even very large and complex models, and there are few ways to do this. Autograd-style models pass around a collection of weights. Depending on how you write your model, there are multiple ways to take gradients with respect to parameters. For example, the function `linear` accepts the parameters as an argument to the model. So, we directly pass in the parameters, `θ`, as an argument to the function being differentiated.
+
+```@docs
+gradient(f, args...)
+```
 
 ```julia
 julia> linear(θ, x) = θ[:W] * x .+ θ[:b]
@@ -168,25 +172,8 @@ julia> (l::Linear)(x) = l.W * x .+ l.b
 julia> model = Linear(rand(2, 5), rand(2))
 Linear([0.267663 … 0.334385], [0.0386873, 0.0203294])
 
+julia> x = rand(5);
+
 julia> dmodel = gradient(model -> sum(model(x)), model)[1]
 (W = [0.652543 … 0.683588], b = [1.0, 1.0])
 ```
-
-Zygote also supports another way to take gradients, via *implicit parameters*. Here the loss function takes zero arguments, but the variables of interest are indicated by a special `Params` object. The function `linear` which depends on `W` and `b` is executed when the loss function `() -> sum(linear(x))` is called, and hence this dependence is visible to Zygote:
-
-```julia
-julia> W = rand(2, 5); b = rand(2);
-
-julia> linear(x) = W * x .+ b
-linear (generic function with 2 methods)
-
-julia> grads = gradient(() -> sum(linear(x)), Params([W, b]))
-Grads(...)
-
-julia> grads[W], grads[b] # access gradients using arrays as keys
-([0.652543 … 0.683588], [1.0, 1.0])
-```
-
-Here `grads` is a dictionary-like object, whose keys are the same parameters we indicated in `Params`. (In fact it wraps a dictionary using `objectid(W)` as keys, which does not change if the values in `W` are mutated).
-
-This implicit style is the one presently used by [Flux.jl](https://github.com/FluxML/Flux.jl), a closely related machine learning library. It uses structs like `Linear` above to define layers, and the function `Flux.params(model)` returns a `Params` object containing all the parameters of all layers. See [its documentation](https://fluxml.ai/Flux.jl/stable/models/basics/) for more details. When using Zygote for most other purposes, however, the explicit style is usually preferred.

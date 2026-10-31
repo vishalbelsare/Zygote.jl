@@ -1,15 +1,3 @@
-using MacroTools: @q
-
-macro nograd(ex)
-  isexpr(ex, :tuple) || (ex = Expr(:tuple, ex))
-  blk = @q begin end
-  for f in ex.args
-    back = MacroTools.@q _ -> ($__source__; nothing)
-    push!(blk.args, :(@inline Zygote._pullback(::Context, ::Core.Typeof($(esc(f))), args...) = $(esc(f))(args...), $back))
-  end
-  return blk
-end
-
 macro which(ex)
   @capture(ex, f_(args__)) || error("Zygote.@which f(args...)")
   :(InteractiveUtils.@which adjoint(Context(), $(esc(f)), $(esc.(args)...)))
@@ -23,7 +11,7 @@ Use gradient checkpointing on the call `f(xs...)`. This means that
 `checkpointed(f, xs...) === f(xs...)`, but when computing the derivative
 intermediate results from the forward pass of `f` will not be stored. Instead the forward
 pass will be repeated, when computing the derivative.
-This saves memory at the cost of increasing exectution time.
+This saves memory at the cost of increasing execution time.
 
 !!! warning
     If `f` is not a pure function, `checkpointed` will likely give wrong results.
@@ -37,6 +25,46 @@ function Zygote._pullback(ctx::Zygote.AContext, ::typeof(checkpointed), f, xs...
         return (nothing, pb(Δy)...)
     end
     return y, pullback_checkpointed
+end
+
+
+
+"""
+
+    eager_update!(state, model, update!)
+
+Eagerly updates the model parameters, discarding the updated gradients to save memory.
+`model` stores the parameters to be updated, `state` is the optimization state (eg. from Optimisers.jl) matching your model component, and
+`update!` is the function that updates the parameters (eg. from `Optimisers.jl`), usually called as `update!(state, model, grads)`.
+
+If `f` is a function that takes a single layer, called as `h = f(model.layers[i], h, other_args...)` then we can eagerly update with:
+
+```julia
+h = f(Zygote.eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+or combine this with gradient checkpointing (for additional memory saving at the cost of increased execution time) with:
+
+```julia
+h = Zygote.checkpointed(f, eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+If `model.layers[i]` itself is callable, we can use the above by first wrapping it:
+
+```julia
+f(model, xs...) = model(xs...)
+h = f(Zygote.eager_update!(state.layers[i], model.layers[i], Optimisers.update!), h, other_args...)
+```
+
+!!! warning
+    If different layers share trainable parameters, then `eager_update!` will likely give wrong results.
+"""
+function eager_update!(state, model, update!)
+    function update_hook(dmodel)
+        update!(state, model, dmodel)
+        return nothing
+    end
+    return Zygote.hook(update_hook, model)
 end
 
 """
@@ -190,6 +218,10 @@ _gradcopy!(dst::AbstractArray, src::AbstractArray) = copyto!(dst, g isa Number ?
 
 Like [`gradient`](@ref) with implicit parameters, this method takes a zero-argument function
 and returns an `IdDict`-like object, now containing the Jacobian for each parameter.
+
+!!! warning "Deprecated"
+    Implicit parameters are deprecated and will be removed in a future release.
+    Use the explicit form `jacobian(f, args...)` instead.
 
 # Examples
 ```jldoctest; setup=:(using Zygote)

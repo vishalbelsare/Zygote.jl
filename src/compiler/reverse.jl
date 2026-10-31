@@ -1,7 +1,19 @@
-using IRTools: IR, Variable, Pipe, xcall, var, prewalk, postwalk,
+using IRTools: IRTools, IR, Variable, Pipe, xcall, var, prewalk, postwalk,
   blocks, predecessors, successors, argument!, arguments, branches,
   insertafter!, finish, expand!, prune!, substitute!, substitute,
   block, block!, branch!, return!, stmt, meta
+
+
+# TODO: Temporary, to be removed when ChainRulesCore rrules are required to
+# support thunks as an input and all instances of _adjoint_keepthunks in
+# Zygote have been replaces by rrules:
+macro _adjoint_keepthunks(ex)
+  ZygoteRules.gradm(ex, false, true)
+end
+macro _adjoint_keepthunks!(ex)
+  ZygoteRules.gradm(ex, true, true)
+end
+
 
 @inline tuple_va(N, xs) = xs
 @inline tuple_va(N, x, xs...) = (x, tuple_va(N, xs...)...)
@@ -28,6 +40,25 @@ unwrapquote(x::QuoteNode) = x.value
 
 is_getproperty(ex) = iscall(ex, Base, :getproperty)
 
+# `Some(value)` if the global `mod.name` is constant in `world`, else `nothing`. Generators run in
+# their own definition world, not the `world` they generate code for, so with world-partitioned
+# bindings (Julia 1.12+) a plain `isconst` misses globals defined after Zygote was loaded (#1680).
+@static if isdefined(Base, :lookup_binding_partition)
+  function const_global(world::UInt, mod::Module, name::Symbol)
+    bpart = Base.lookup_binding_partition(world, GlobalRef(mod, name))
+    while Base.is_some_binding_imported(Base.binding_kind(bpart))
+      bpart = Base.lookup_binding_partition(world, Base.partition_restriction(bpart)::Core.Binding)
+    end
+    Base.is_defined_const_binding(Base.binding_kind(bpart)) || return nothing
+    return Some(Base.partition_restriction(bpart))
+  end
+else
+  const_global(world::UInt, mod::Module, name::Symbol) =
+    isconst(mod, name) ? Some(getfield(mod, name)) : nothing
+end
+
+isconst_global(world, mod, name) = const_global(world, mod, name) !== nothing
+
 # The initial premise of literal_getproperty was in some ways inherently flawed, because for
 # getproperty it was intended that _pullback falls back to literal_getproperty, but we actually
 # want the opposite to happen, since Zygote should fall back to recursing into the getproperty
@@ -35,13 +66,20 @@ is_getproperty(ex) = iscall(ex, Base, :getproperty)
 # literal_getproperty, though. We can't really have mutually recursive definitions here, so we
 # now always instrument getproperty as literal_getproperty, no matter whether the second
 # argument is a literal or not.
-function instrument_getproperty!(ir, v, ex)
+function instrument_getproperty!(ir, v, ex, world)
   if is_getproperty(ex)
-    if ex.args[3] isa Union{QuoteNode,Integer}
-      ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], Val(unwrapquote(ex.args[3])))
+    obj, prop = ex.args[2], ex.args[3]
+    if obj isa Module && prop isa QuoteNode && isconst_global(world, obj, unwrapquote(prop))
+      # Metaprogramming can generate getproperty(::Module, ...) calls.
+      # Like other types, these are type unstable without constprop.
+      # However, literal_getproperty's heuristic is also not general enough for modules.
+      # Thankfully, we can skip instrumenting these if they're const properties.
+      ex
+    elseif prop isa Union{QuoteNode,Integer}
+      ir[v] = xcall(Zygote, :literal_getproperty, obj, Val(unwrapquote(prop)))
     else
-      f = insert!(ir, v, :(Val($(ex.args[3]))))
-      ir[v] = xcall(Zygote, :literal_getproperty, ex.args[2], f)
+      f = insert!(ir, v, :(Val($(prop))))
+      ir[v] = xcall(Zygote, :literal_getproperty, obj, f)
     end
   else
     ex
@@ -86,46 +124,49 @@ function instrument_iterate!(ir, v, ex)
   end
 end
 
-function instrument_literals!(ir, v, ex)
-  ex = instrument_getproperty!(ir, v, ex)
+function instrument_literals!(ir, v, ex, world)
+  ex = instrument_getproperty!(ir, v, ex, world)
   ex = instrument_getfield!(ir, v, ex)
   ex = instrument_getindex!(ir, v, ex)
   ex = instrument_iterate!(ir, v, ex)
 end
 
-function istrackable(x)
+function istrackable(x, world)
   x isa GlobalRef && x.mod ∉ (Base, Core) || return false
-  isconst(x.mod, x.name) || return true
-  x = getfield(x.mod, x.name)
+  val = const_global(world, x.mod, x.name)
+  val === nothing && return true
+  x = something(val)
   !(x isa Type || sizeof(x) == 0)
 end
 
-function instrument_global!(ir, v, ex)
-  if istrackable(ex)
+function instrument_global!(ir, v, ex, world)
+  if istrackable(ex, world)
     ir[v] = xcall(Zygote, :unwrap, QuoteNode(ex), ex)
   else
     ir[v] = prewalk(ex) do x
-      istrackable(x) || return x
+      istrackable(x, world) || return x
       insert!(ir, v, xcall(Zygote, :unwrap, QuoteNode(x), x))
     end
   end
 end
 
-function instrument(ir::IR)
+function instrument(ir::IR; world = Base.get_world_counter())
   pr = Pipe(ir)
   for (v, st) in pr
     ex = st.expr
     if isexpr(ex, :foreigncall, :isdefined)
       continue
-    elseif isexpr(ex, :enter, :leave)
-      error("try/catch is not supported.")
     elseif isexpr(ex, :(=))
       @assert ex.args[1] isa GlobalRef
       pr[v] = xcall(Zygote, :global_set, QuoteNode(ex.args[1]), ex.args[2])
+    elseif isexpr(ex, :boundscheck)
+      # Expr(:boundscheck) now appears in common Julia code paths, so we need to handle it.
+      # For correctness sake, fix to true like https://github.com/dfdx/Umlaut.jl/issues/34.
+      pr[v] = true
     else
       ex = instrument_new!(pr, v, ex)
-      ex = instrument_literals!(pr, v, ex)
-      ex = instrument_global!(pr, v, ex)
+      ex = instrument_literals!(pr, v, ex, world)
+      ex = instrument_global!(pr, v, ex, world)
     end
   end
   ir = finish(pr)
@@ -166,17 +207,32 @@ ignored_f(f) = f in (GlobalRef(Base, :not_int),
 ignored_f(ir, f) = ignored_f(f)
 ignored_f(ir, f::Variable) = ignored_f(get(ir, f, nothing))
 
-ignored(ir, ex) = isexpr(ex, :call) && ignored_f(ir, ex.args[1])
-ignored(ir, ex::Variable) = ignored(ir, ir[ex])
+function ignored(ir, ex, world)
+  isexpr(ex, :call) || return false
+  f = ex.args[1]
+  ignored_f(ir, f) && return true
+  if f isa Variable && haskey(ir, f)
+    f = ir[f].expr
+  end
+  if f == GlobalRef(Base, :getproperty) && length(ex.args) >= 3
+    obj, prop = ex.args[2], ex.args[3]
+    # Metaprogramming can generate getproperty(::Module, ...) calls.
+    # These are type unstable without constprop, which transforming to _pullback breaks.
+    # However, we can skip differentiating these if they're const properties.
+    obj isa Module && prop isa QuoteNode && isconst_global(world, obj, unwrapquote(prop)) && return true
+  end
+  return false
+end
+ignored(ir, ex::Variable, world) = ignored(ir, ir[ex], world)
 
-function primal(ir::IR)
+function primal(ir::IR, world)
   pr = Pipe(ir)
   pbs = Dict{Variable,Variable}()
   argument!(pr, at = 1)
   cx = argument!(pr, Context, at = 2)
   for (v, st) in pr
     ex = st.expr
-    if isexpr(ex, :call) && !ignored(ir, ex)
+    if isexpr(ex, :call) && !ignored(ir, ex, world)
       yJ = insert!(pr, v, stmt(xcall(Zygote, :_pullback, cx, ex.args...),
                                line = ir[v].line))
       pr[v] = xgetindex(yJ, 1)
@@ -198,9 +254,9 @@ struct Primal
   pullbacks::Dict{Variable,Variable}
 end
 
-function Primal(ir::IR; varargs = nothing)
-  ir = instrument(normalise!(ir))
-  pr, brs, pbs = primal(ir)
+function Primal(ir::IR; varargs = nothing, world = Base.get_world_counter())
+  ir = instrument(normalise!(ir); world)
+  pr, brs, pbs = primal(ir, world)
   Primal(expand!(ir), pr, varargs, brs, pbs)
 end
 
@@ -214,12 +270,11 @@ Base.show(io::IO, x::Alpha) = print(io, "@", x.id)
 
 alpha(x) = x
 alpha(x::Variable) = Alpha(x.id)
-Variable(a::Alpha) = Variable(a.id)
+IRTools.Variable(a::Alpha) = Variable(a.id)
 
 sig(b::IRTools.Block) = unique([arg for br in branches(b) for arg in br.args if arg isa Variable])
 sig(pr::Primal) = Dict(b.id => sig(b) for b in blocks(pr.ir))
 
-# TODO unreachables?
 function adjointcfg(pr::Primal)
   ir = empty(pr.ir)
   return!(ir, nothing)
@@ -232,7 +287,9 @@ function adjointcfg(pr::Primal)
         push!(rb, xcall(Base, :(!==), alpha(pr.branches[b.id]), BranchNumber(i)))
       branch!(rb, preds[i].id, unless = cond)
     end
-    if !isempty(branches(b)) && branches(b)[end] == IRTools.unreachable
+    if isempty(preds) || (!isempty(branches(b)) && branches(b)[end] == IRTools.unreachable)
+      # If `b` is unreachable, then no context produced by the primal should end up branching to `rb`
+      push!(rb, xcall(Base, :error, "unreachable")) # `throw` is necessary for inference not to hit the `unreachable`
       branch!(rb, 0)
     end
   end
@@ -251,8 +308,18 @@ xaccum(ir) = nothing
 xaccum(ir, x) = x
 xaccum(ir, xs...) = push!(ir, xcall(Zygote, :accum, xs...))
 
+function passthrough_expr(ex::Expr)
+    # Metadata we want to preserve
+    isexpr(ex, GlobalRef, :call, :isdefined, :inbounds, :meta, :loopinfo, :enter, :leave, :catch) && return true
+    # ccalls and more that are safe to preserve/required for proper operation:
+    # - jl_set_task_threadpoolid: added in 1.9 for @spawn
+    isexpr(ex, :foreigncall) && unwrapquote(ex.args[1]) in (:jl_set_task_threadpoolid,) && return true
+    return false
+end
+
 function adjoint(pr::Primal)
   ir, sigs = adjointcfg(pr)
+  catch_blocks = falses(length(blocks(pr.ir)))
   for b in reverse(blocks(pr.ir))
     rb = block(ir, b.id)
     grads = Dict()
@@ -262,9 +329,15 @@ function adjoint(pr::Primal)
     for i = 1:length(sigs[b.id])
       grad(sigs[b.id][i], arguments(rb)[i])
     end
+
     # Backprop through statements
     for v in reverse(keys(b))
       ex = b[v].expr
+
+      if isexpr(ex, :catch)
+        catch_blocks[first(ex.args)] = true
+      end
+
       if haskey(pr.pullbacks, v)
         g = push!(rb, stmt(Expr(:call, alpha(pr.pullbacks[v]), grad(v)),
                            line = b[v].line))
@@ -275,14 +348,18 @@ function adjoint(pr::Primal)
         end
       elseif ex isa Core.PiNode
         grads[ex.val] = grads[v]
-      elseif isexpr(ex, GlobalRef, :call, :isdefined, :inbounds, :meta, :loopinfo)
-      elseif isexpr(ex)
-        push!(rb, stmt(xcall(Base, :error, "Can't differentiate $(ex.head) expression"),
+      elseif isexpr(ex) && !passthrough_expr(ex)
+        push!(rb, stmt(xcall(Base, :error, """
+                             Can't differentiate $(ex.head) expression $ex.
+                             You might want to check the Zygote limitations documentation.
+                             https://fluxml.ai/Zygote.jl/latest/limitations
+                             """),
                        line = b[v].line))
       else # A literal value
         continue
       end
     end
+
     if b.id > 1 # Backprop through (predecessor) branch arguments
       gs = grad.(arguments(b))
       for br in branches(rb)
@@ -303,6 +380,22 @@ function adjoint(pr::Primal)
       branches(rb)[1].args[1] = Δ
     end
   end
+
+  for (id, is_catch) in enumerate(catch_blocks)
+    is_catch || continue
+
+    b = block(pr.ir, id)
+    rb = block(ir, id)
+    lines = [st.line for (_, st) in b if st.line > 0]
+    err_message = if isempty(lines)
+      "Can't differentiate function execution in catch block"
+    else
+      li = pr.ir.lines[first(lines)]
+      "Can't differentiate function execution in catch block at $(li.file):$(li.line)."
+    end
+    pushfirst!(rb, stmt(xcall(Base, :error, err_message)))
+  end
+
   return ir
 end
 
@@ -311,8 +404,8 @@ struct Adjoint
   adjoint::IR
 end
 
-function Adjoint(ir::IR; varargs = nothing, normalise = true)
-  pr = Primal(ir, varargs = varargs)
+function Adjoint(ir::IR; varargs = nothing, normalise = true, world = Base.get_world_counter())
+  pr = Primal(ir; varargs, world)
   adj = adjoint(pr) |> prune!
   if normalise
     permute!(adj, length(adj.blocks):-1:1)

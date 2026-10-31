@@ -1,5 +1,6 @@
-using Zygote, Test
+using Zygote, Test, LinearAlgebra
 using Zygote: Params, gradient, forwarddiff
+using FillArrays: Fill
 
 @testset "gradient checkpointing" begin
 
@@ -94,286 +95,257 @@ using Zygote: Params, gradient, forwarddiff
     end
 end
 
+@testset "misc" begin
+  add(a, b) = a+b
+  _relu(x) = x > 0 ? x : 0
+  f(a, b...) = +(a, b...)
 
-add(a, b) = a+b
-_relu(x) = x > 0 ? x : 0
-f(a, b...) = +(a, b...)
+  y, back = pullback(identity, 1)
+  dx = back(2)
+  @test y == 1
+  @test dx == (2,)
 
-y, back = pullback(identity, 1)
-dx = back(2)
-@test y == 1
-@test dx == (2,)
+  mul(a, b) = a*b
+  y, back = pullback(mul, 2, 3)
+  dx = back(4)
+  @test y == 6
+  @test dx == (12, 8)
 
-mul(a, b) = a*b
-y, back = pullback(mul, 2, 3)
-dx = back(4)
-@test y == 6
-@test dx == (12, 8)
+  @test gradient(mul, 2, 3) == (3, 2)
+  @test withgradient(mul, 2, 3) == (val = 6, grad = (3, 2))
 
-@test gradient(mul, 2, 3) == (3, 2)
-@test withgradient(mul, 2, 3) == (val = 6, grad = (3, 2))
+  bool = true
+  b(x) = bool ? 2x : x
 
-bool = true
-b(x) = bool ? 2x : x
+  y, back = pullback(b, 3)
+  dx = back(4)
+  @test y == 6
+  @test dx == (8,)
 
-y, back = pullback(b, 3)
-dx = back(4)
-@test y == 6
-@test dx == (8,)
+  fglobal = x -> 5x
+  gglobal = x -> fglobal(x)
 
-fglobal = x -> 5x
-gglobal = x -> fglobal(x)
+  @test gradient(gglobal, 2) == (5,)
 
-@test gradient(gglobal, 2) == (5,)
+  global bool = false
 
-global bool = false
+  y, back = pullback(b, 3)
+  dx = back(4)
+  @test y == 3
+  @test getindex.(dx) == (4,)
 
-y, back = pullback(b, 3)
-dx = back(4)
-@test y == 3
-@test getindex.(dx) == (4,)
+  y, back = pullback(x -> sum(x.*x), [1, 2, 3])
+  dxs = back(1)
+  @test y == 14
+  @test dxs == ([2,4,6],)
 
-y, back = pullback(x -> sum(x.*x), [1, 2, 3])
-dxs = back(1)
-@test y == 14
-@test dxs == ([2,4,6],)
-
-function pow(x, n)
-  r = 1
-  while n > 0
-    n -= 1
-    r *= x
+  function pow(x, n)
+    r = 1
+    while n > 0
+      n -= 1
+      r *= x
+    end
+    return r
   end
-  return r
-end
 
-@test gradient(pow, 2, 3) == (12,nothing)
+  @test gradient(pow, 2, 3) == (12,nothing)
 
-function pow_mut(x, n)
-  r = Ref(one(x))
-  while n > 0
-    n -= 1
-    r[] = r[] * x
+  function pow_mut(x, n)
+    r = Ref(one(x))
+    while n > 0
+      n -= 1
+      r[] = r[] * x
+    end
+    return r[]
   end
-  return r[]
-end
 
-@test gradient(pow_mut, 2, 3) == (12,nothing)
+  @test gradient(pow_mut, 2, 3) == (12,nothing)
 
-r = 1
-function pow_global(x, n)
-  global r
-  while n > 0
-    r *= x
-    n -= 1
+  @test gradient(x -> 1, 2) == (nothing,)
+
+  @test gradient(t -> t[1]*t[2], (2, 3)) == ((3, 2),)
+
+  @test gradient(x -> x.re, 2+3im) === (1.0 + 0.0im,)  # one NamedTuple
+  @test gradient(x -> x.re*x.im, 2+3im) == (3.0 + 2.0im,)  # two, different fields
+  @test gradient(x -> x.re*x.im + x.re, 2+3im) == (4.0 + 2.0im,)  # three, with accumulation
+
+  @test gradient(x -> abs2(x * x.re), 4+5im) == (456.0 + 160.0im,)   # gradient participates
+  @test gradient(x -> abs2(x * real(x)), 4+5im) == (456.0 + 160.0im,)   # function not getproperty
+  @test gradient(x -> abs2(x * getfield(x, :re)), 4+5im) == (456.0 + 160.0im,)
+
+  struct Bar{T}
+    a::T
+    b::T
   end
-  return r
-end
 
-@test gradient(pow_global, 2, 3) == (12,nothing)
-
-@test gradient(x -> 1, 2) == (nothing,)
-
-@test gradient(t -> t[1]*t[2], (2, 3)) == ((3, 2),)
-
-@test gradient(x -> x.re, 2+3im) === (1.0 + 0.0im,)  # one NamedTuple
-@test gradient(x -> x.re*x.im, 2+3im) == (3.0 + 2.0im,)  # two, different fields
-@test gradient(x -> x.re*x.im + x.re, 2+3im) == (4.0 + 2.0im,)  # three, with accumulation
-
-@test gradient(x -> abs2(x * x.re), 4+5im) == (456.0 + 160.0im,)   # gradient participates
-@test gradient(x -> abs2(x * real(x)), 4+5im) == (456.0 + 160.0im,)   # function not getproperty
-@test gradient(x -> abs2(x * getfield(x, :re)), 4+5im) == (456.0 + 160.0im,)
-
-struct Bar{T}
-  a::T
-  b::T
-end
-
-function mul_struct(a, b)
-  c = Bar(a, b)
-  c.a * c.b
-end
-
-@test gradient(mul_struct, 2, 3) == (3, 2)
-
-function mul_tuple(a, b)
-  c = (a, b)
-  c[1] * c[2]
-end
-
-@test gradient(mul_tuple, 2, 3) == (3, 2)
-
-function mul_lambda(x, y)
-  g = z -> x * z
-  g(y)
-end
-
-@test gradient(mul_lambda, 2, 3) == (3, 2)
-
-@test gradient((a, b...) -> *(a, b...), 2, 3) == (3, 2)
-
-@test gradient((x, a...) -> x, 1) == (1,)
-@test gradient((x, a...) -> x, 1, 1) == (1,nothing)
-@test gradient((x, a...) -> x == a, 1) == (nothing,)
-@test gradient((x, a...) -> x == a, 1, 2) == (nothing,nothing)
-
-kwmul(; a = 1, b) = a*b
-
-mul_kw(a, b) = kwmul(a = a, b = b)
-
-@test gradient(mul_kw, 2, 3) == (3, 2)
-
-function myprod(xs)
-  s = 1
-  for x in xs
-    s *= x
+  function mul_struct(a, b)
+    c = Bar(a, b)
+    c.a * c.b
   end
-  return s
-end
 
-@test gradient(myprod, [1,2,3])[1] == [6,3,2]
+  @test gradient(mul_struct, 2, 3) == (3, 2)
 
-function mul_vec(a, b)
-  xs = [a, b]
-  xs[1] * xs[2]
-end
-
-@test gradient(mul_vec, 2, 3) == (3, 2)
-
-@test gradient(2) do x
-  d = Dict()
-  d[:x] = x
-  x * d[:x]
-end == (4,)
-
-f(args...;a=nothing,kwargs...) = g(a,args...;kwargs...)
-g(args...;x=1,idx=Colon(),kwargs...) = x[idx]
-@test gradient(x->sum(f(;x=x,idx=1:1)),ones(2))[1] == [1., 0.]
-
-pow_rec(x, n) = n == 0 ? 1 : x*pow_rec(x, n-1)
-
-@test gradient(pow_rec, 2, 3) == (12, nothing)
-
-# For nested AD, until we support errors
-function grad(f, args...)
-  y, back = pullback(f, args...)
-  return back(1)
-end
-
-D(f, x) = grad(f, x)[1]
-
-@test D(x -> D(sin, x), 0.5) == -sin(0.5)
-@test D(x -> x*D(y -> x+y, 1), 1) == 1
-@test D(x -> x*D(y -> x*y, 1), 4) == 8
-
-@test sin''(1.0) ==  -sin(1.0)
-@test sin'''(1.0) ==  -cos(1.0)
-
-f(x) = throw(DimensionMismatch("fubar"))
-
-@test_throws DimensionMismatch gradient(f, 1)
-
-struct Layer{T}
-  W::T
-end
-
-(f::Layer)(x) = f.W * x
-
-W = [1 0; 0 1]
-x = [1, 2]
-
-y, back = pullback(() -> W * x, Params([W]))
-@test y == [1, 2]
-@test back([1, 1])[W] == [1 2; 1 2]
-
-layer = Layer(W)
-
-y, back = pullback(() -> layer(x), Params([W]))
-@test y == [1, 2]
-@test back([1, 1])[W] == [1 2; 1 2]
-
-@test gradient(() -> sum(W * x), Params([W]))[W] == [1 2; 1 2]
-y, gr = withgradient(() -> sum(W * x), Params([W]))
-@test y == 3
-@test gr[W] == [1 2; 1 2]
-
-let
-  p = [1]
-  θ = Zygote.Params([p])
-  θ̄ = gradient(θ) do
-    p′ = (p,)[1]
-    p′[1]
+  function mul_tuple(a, b)
+    c = (a, b)
+    c[1] * c[2]
   end
-  @test θ̄[p][1] == 1
+
+  @test gradient(mul_tuple, 2, 3) == (3, 2)
+
+  function mul_lambda(x, y)
+    g = z -> x * z
+    g(y)
+  end
+
+  @test gradient(mul_lambda, 2, 3) == (3, 2)
+
+  @test gradient((a, b...) -> *(a, b...), 2, 3) == (3, 2)
+
+  @test gradient((x, a...) -> x, 1) == (1,)
+  @test gradient((x, a...) -> x, 1, 1) == (1,nothing)
+  @test gradient((x, a...) -> x == a, 1) == (nothing,)
+  @test gradient((x, a...) -> x == a, 1, 2) == (nothing,nothing)
+
+  kwmul(; a = 1, b) = a*b
+
+  mul_kw(a, b) = kwmul(a = a, b = b)
+
+  @test gradient(mul_kw, 2, 3) == (3, 2)
+
+  function myprod(xs)
+    s = 1
+    for x in xs
+      s *= x
+    end
+    return s
+  end
+
+  @test gradient(myprod, [1,2,3])[1] == [6,3,2]
+
+  function mul_vec(a, b)
+    xs = [a, b]
+    xs[1] * xs[2]
+  end
+
+  @test gradient(mul_vec, 2, 3) == (3, 2)
+
+  @test gradient(2) do x
+    d = Dict()
+    d[:x] = x
+    x * d[:x]
+  end == (4,)
+
+  f(args...;a=nothing,kwargs...) = g(a,args...;kwargs...)
+  g(args...;x=1,idx=Colon(),kwargs...) = x[idx]
+  @test gradient(x->sum(f(;x=x,idx=1:1)),ones(2))[1] == [1., 0.]
+
+  pow_rec(x, n) = n == 0 ? 1 : x*pow_rec(x, n-1)
+
+  @test gradient(pow_rec, 2, 3) == (12, nothing)
+
+  f(x) = throw(DimensionMismatch("fubar"))
+
+  @test_throws DimensionMismatch gradient(f, 1)
+
+  # NOTE: implicit-params tests (structs/closures with `Params`) live in test/deprecated.jl
+
+  @test gradient(2) do x
+    H = [1 x; 3 4]
+    sum(H)
+  end[1] == 1
+
+  @test gradient(2) do x
+    if x < 0
+      throw("foo")
+    end
+    return x*5
+  end[1] == 5
+
+  @test gradient(x -> one(eltype(x)), rand(10))[1] === nothing
+
+  # Three-way control flow merge
+  @test gradient(1) do x
+    if x > 0
+      x *= 2
+    elseif x < 0
+      x *= 3
+    end
+    x
+  end[1] == 2
+
+  # Gradient of closure
+  grad_closure(x) = 2x
+
+  Zygote.@adjoint (f::typeof(grad_closure))(x) = f(x), Δ -> (1, 2)
+
+  @test gradient((f, x) -> f(x), grad_closure, 5) == (1, 2)
+
+  invokable(x) = 2x
+  invokable(x::Integer) = 3x
+  @test gradient(x -> invoke(invokable, Tuple{Any}, x), 5) == (2,)
+
+  y, back = Zygote.pullback(x->tuple(x...), [1, 2, 3])
+  @test back((1, 1, 1)) == ((1,1,1),)
 end
 
-@test gradient(2) do x
-  H = [1 x; 3 4]
-  sum(H)
-end[1] == 1
-
-@test gradient(2) do x
-  if x < 0
-    throw("foo")
+@testset "nested AD" begin
+  # For nested AD, until we support errors
+  function grad(f, args...)
+    y, back = pullback(f, args...)
+    return back(1)
   end
-  return x*5
-end[1] == 5
 
-@test gradient(x -> one(eltype(x)), rand(10))[1] === nothing
+  D(f, x) = grad(f, x)[1]
 
-# Thre-way control flow merge
-@test gradient(1) do x
-  if x > 0
-    x *= 2
-  elseif x < 0
-    x *= 3
+  @test D(x -> D(sin, x), 0.5) == -sin(0.5)
+  @test D(x -> x*D(y -> x+y, 1), 1) == 1
+  @test D(x -> x*D(y -> x*y, 1), 4) == 8
+
+  @test sin''(1.0) ==  -sin(1.0)
+  @test sin'''(1.0) ==  -cos(1.0)
+end
+
+@testset "compiler error" begin
+  # Test for some compiler errors on complex CFGs
+  function f(x)
+    while true
+      true && return
+      foo(x) && break
+    end
   end
-  x
-end[1] == 2
 
-# Gradient of closure
-grad_closure(x) = 2x
+  @test Zygote.@code_adjoint(f(1)) isa Zygote.Adjoint
 
-Zygote.@adjoint (f::typeof(grad_closure))(x) = f(x), Δ -> (1, 2)
+  @test_throws ErrorException Zygote.gradient(1) do x
+    push!([], x)
+    return x
+  end
 
-@test gradient((f, x) -> f(x), grad_closure, 5) == (1, 2)
+  @test gradient(1) do x
+    stk = []
+    Zygote._push!(stk, x)
+    stk = Zygote.Stack(stk)
+    pop!(stk)
+  end == (1,)
 
-invokable(x) = 2x
-invokable(x::Integer) = 3x
-@test gradient(x -> invoke(invokable, Tuple{Any}, x), 5) == (2,)
+  @test gradient(x -> [x][1].a, Bar(1, 1)) == ((a=1, b=nothing),)
 
-y, back = Zygote.pullback(x->tuple(x...), [1, 2, 3])
-@test back((1, 1, 1)) == ((1,1,1),)
+  @test gradient((a, b) -> Zygote.hook(-, a)*b, 2, 3) == (-3, 2)
 
-# Test for some compiler errors on complex CFGs
-function f(x)
-  while true
-    true && return
-    foo(x) && break
+  @test gradient(5) do x
+    forwarddiff(x -> x^2, x)
+  end == (10,)
+end
+
+@testset "Gradient chunking" begin
+  for chunk_threshold in 1:10:100
+    x = [1:100;]
+    @test gradient(x) do x
+      Zygote.forwarddiff(x -> x' * x, x; chunk_threshold = chunk_threshold)
+    end == (2 * x,)
   end
 end
 
-@test Zygote.@code_adjoint(f(1)) isa Zygote.Adjoint
-
-@test_throws ErrorException Zygote.gradient(1) do x
-  push!([], x)
-  return x
-end
-
-@test gradient(1) do x
-  stk = []
-  Zygote._push!(stk, x)
-  stk = Zygote.Stack(stk)
-  pop!(stk)
-end == (1,)
-
-@test gradient(x -> [x][1].a, Bar(1, 1)) == ((a=1, b=nothing),)
-
-@test gradient((a, b) -> Zygote.hook(-, a)*b, 2, 3) == (-3, 2)
-
-@test gradient(5) do x
-  forwarddiff(x -> x^2, x)
-end == (10,)
 
 @test gradient(1) do x
   if true
@@ -384,35 +356,53 @@ end == (10,)
 end == (2,)
 
 global_param = 3
+global_r = 1
 
 @testset "Global Params" begin
   cx = Zygote.Context()
   y, back = Zygote._pullback(cx, x -> x*global_param, 2)
   @test y == 6
   @test back(1) == (nothing, 3)
-  Zygote.cache(cx)[GlobalRef(Main, :global_param)] == 2
-end
+  ref = first(keys(Zygote.cache(cx)))
+  @test ref isa GlobalRef
+  @test_broken ref.mod == Main # TODO module is now "features###"
+  @test ref.name == :global_param
+  @test Zygote.cache(cx)[ref] == 2
 
-function pow_try(x)
-  try
-    2x
-  catch e
-    println("error")
+  function pow_global(x, n)
+    global global_r
+    while n > 0
+      global_r *= x
+      n -= 1
+    end
+    return global_r
   end
+
+  @test gradient(pow_global, 2, 3) == (12, nothing) broken=VERSION>=v"1.12"
 end
 
-@test_broken gradient(pow_try, 1) == (2,)
-@test_throws Zygote.CompileError gradient(pow_try, 1)
 
-function pow_simd(x, n)
-  r = 1
-  @simd for i = 1:n
-    r *= x
+@testset "pow" begin
+  function pow_try(x)
+    try
+      2x
+    catch e
+      println("error")
+    end
   end
-  return r
-end
 
-@test gradient(pow_simd, 2, 3) == (12,nothing)
+  @test gradient(pow_try, 1) == (2,)
+
+  function pow_simd(x, n)
+    r = 1
+    @simd for i = 1:n
+      r *= x
+    end
+    return r
+  end
+
+  @test gradient(pow_simd, 2, 3) == (12,nothing)
+end
 
 @testset "tuple getindex" begin
   @test gradient(x -> size(x)[2], ones(2,2,2)) == (nothing,)
@@ -430,7 +420,11 @@ end
 end
 
 @testset "@timed" begin
-  @test gradient(x -> first(@timed x), 0) == (1,)
+  if VERSION >= v"1.11"
+    @test_broken gradient(x -> first(@timed x), 0) == (1,)
+  else
+    @test gradient(x -> first(@timed x), 0) == (1,)
+  end
 end
 
 mutable struct MyMutable
@@ -452,6 +446,19 @@ let
   @test back(1.) == ((1.0,),)
 end
 
+mutable struct MWEGetter{G, U}
+  idxs::G
+  u::U
+end
+
+u = ones(3)
+idxs = [1, 2]
+mwe1574 = MWEGetter(idxs, u)
+
+function fn1574(mwe)
+  map(i -> mwe.u[i], mwe.idxs)
+end
+
 @testset "mutable struct, including Ref" begin
   # Zygote's representation is Base.RefValue{Any}((value = 7.0,)), but the
   # map to ChainRules types and back normalises to (value = 7.0,) same as struct:
@@ -466,7 +473,7 @@ end
   @test_broken gradient(x -> abs2(x[1].x) + 7 * x[1].x.re, [Ref(1+im)]) == ([(x = 9.0 + 2.0im,)],)
   @test_broken gradient(x -> abs2(x[1].x) + 7 * real(x[1].x), [Ref(1+im)]) == ([(x = 9.0 + 2.0im,)],)  # worked on 0.6.0, 0.6.20
 
-  @test_broken gradient(x -> abs2(x[].x) + 7 * real(x[].x), Ref(Ref(1+im))) == ((x = 9.0 + 2.0im,),)  # gives nothing, same in 0.6.0
+  @test gradient(x -> abs2(x[].x) + 7 * real(x[].x), Ref(Ref(1+im))) == ((x = (x = 9.0 + 2.0im,),),) # gave `nothing` from 0.6.0 to 0.6.41
 
   # Array of mutables:
   @test gradient(x -> sum(getindex.(x).^2), Ref.(1:3))[1] == [(;x=2i) for i in 1:3]
@@ -475,9 +482,59 @@ end
   @test gradient(x -> (getindex.(x).^2)[1], Ref.(1:3))[1][1] == (x=2.0,)  # rest are (x = 0.0,), but nothing would be OK too
   @test gradient(x -> (prod.(getindex.(x)))[1], Ref.(eachcol([1 2; 3 4])))[1][1] == (x = [3.0, 1.0],)
 
-  # Broadcasting over Ref is handled specially. Tested elsehwere too.
+  # Broadcasting over Ref is handled specially. Tested elsewhere too.
   @test gradient(x -> sum(sum, x .* [1,2,3]), Ref([4,5])) == ((x = [6.0, 6.0],),)
   @test gradient(x -> sum(sum, Ref(x) .* [1,2,3]), [4,5]) == ([6.0, 6.0],)
+
+  # Broadcasting/ Mapping over Mutables with differring graphs for fields
+  @test gradient(x -> sum(fn1574(x)), mwe1574)[1] == (; idxs = [nothing, nothing], u = [1.0, 1.0, 0.0])
+end
+
+@testset "mutable accum_param bugs" begin
+  mutable struct Mut{T}; x::T; end
+  struct Imm{T}; x::T; end
+
+  # Indexing a tuple containing a mutable struct gave `nothing`
+  x1 = (Mut(3.0),)
+  x2 = (Imm(3.0),)
+  x3 = (Ref(3.0),)
+  @test gradient(x -> x[1].x^2, x1)[1] == ((x = 6.0,),)  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> x[1].x^2, x2)[1] == ((x = 6.0,),)
+  @test gradient(x -> x[1].x^2, x3)[1] == ((x = 6.0,),)  # fails on v0.6.0 v0.6.41
+  i1 = 1
+  @test gradient(x -> x[i1].x^2, x1)[1] == ((x = 6.0,),)  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> x[i1].x^2, x2)[1] == ((x = 6.0,),)
+  @test gradient(x -> x[i1].x^2, x3)[1] == ((x = 6.0,),)  # fails on v0.6.0 v0.6.41
+
+  @test gradient(x -> x[1][1].x^2, [x1])[1] == [((x = 6.0,),)]  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> x[1][1].x^2, [x2])[1] == [((x = 6.0,),)]
+  @test gradient(x -> x[1][1].x^2, [x3])[1] == [((x = 6.0,),)]  # fails on v0.6.0 v0.6.41
+
+  # When `getfield` returns a mutable struct, it gave `nothing`:
+  x4 = Imm(Mut(4.0))
+  x5 = Mut(Mut(4.0))
+  x6 = Imm(Imm(4.0))
+  @test gradient(x -> x.x.x^3, x4)[1] == (x = (x = 48.0,),)  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> x.x.x^3, x5)[1] == (x = (x = 48.0,),)  # fails on v0.6.0
+  @test gradient(x -> x.x.x^3, x6)[1] == (x = (x = 48.0,),)  # fails on v0.6.41
+
+  @test gradient(x -> x[2].x.x^3, [x4, x4])[1] == [nothing, (x = (x = 48.0,),)]  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> x[2].x.x^3, [x4, x5])[1] == [nothing, (x = (x = 48.0,),)]  # fails on v0.6.0
+  @test gradient(x -> x[2].x.x^3, [x4, x6])[1] == [nothing, (x = (x = 48.0,),)]  # fails on v0.6.41
+
+  # Check when using implicit parameters, Params cases used to pass:
+  y1 = [3.0]
+  y2 = (Mut(y1),)
+  y3 = (Imm(y1),)
+  @test_skip gradient(x -> sum(x[1].x)^2, y2)[1] == ((x = [6.0],),)  # fails on v0.6.0 v0.6.41... and with https://github.com/FluxML/Zygote.jl/pull/1453
+  @test gradient(x -> sum(x[1].x)^2, y3)[1] == ((x = [6.0],),)
+
+  @test gradient(x -> sum(x[1].x .+ x[1].x)^3, y2)[1] == ((x = [216.0],),)  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> sum(x[1].x .+ x[1].x)^3, y3)[1] == ((x = [216.0],),)
+
+  i1 = 1
+  @test gradient(x -> sum(x[i1].x .+ x[1].x)^3, y2)[1] == ((x = [216.0],),)  # fails on v0.6.0 v0.6.41
+  @test gradient(x -> sum(x[i1].x .+ x[1].x)^3, y3)[1] == ((x = [216.0],),)
 end
 
 @testset "NamedTuples" begin
@@ -489,6 +546,17 @@ end
   @test gradient(x -> x[].a, Ref((a=1, b=2))) == ((x = (a = 1, b = nothing),),)
   @test gradient(x -> x[1][].a, [Ref((a=1, b=2)), Ref((a=3, b=4))]) == ([(x = (a = 1, b = nothing),), nothing],)
   @test gradient(x -> x[1].a, [(a=1, b=2), "three"]) == ([(a = 1, b = nothing), nothing],)
+
+  @testset "indexing kwargs" begin
+    inner_lit_index(; kwargs...) = kwargs[:x]
+    outer_lit_index(; kwargs...) = inner_lit_index(; x=kwargs[:x])
+
+    inner_dyn_index(k; kwargs...) = kwargs[k]
+    outer_dyn_index(k; kwargs...) = inner_dyn_index(k; x=kwargs[k])
+
+    @test gradient(x -> outer_lit_index(; x), 0.0) == (1.0,)
+    @test gradient((x, k) -> outer_dyn_index(k; x), 0.0, :x) == (1.0, nothing)
+  end
 end
 
 function type_test()
@@ -499,7 +567,7 @@ end
 
 @testset "Pairs" begin
   @test (x->10*pairs((a=x, b=2))[1])'(100) === 10.0
-  @test (x->10*pairs((a=x, b=2))[2])'(100) === 0
+  @test (x->10*pairs((a=x, b=2))[2])'(100) === nothing
   foo(;kw...) = 1
   @test gradient(() -> foo(a=1,b=2.0)) === ()
 
@@ -507,7 +575,7 @@ end
   @test (x->10*(x => 2)[2])'(100) === nothing
 
   @test gradient(x-> (:x => x)[2], 17) == (1,)
-    
+
   d = Dict(:x=>1.0, :y=>3.0);
   @test gradient(d -> Dict(:x => d[:x])[:x], d) == (Dict(:x => 1),)
 end
@@ -515,8 +583,12 @@ end
 @testset "kwarg splatting, pass in object" begin
   g(; kwargs...) = kwargs[:x] * kwargs[:z]
   h(somedata) = g(; somedata...)
-  @test gradient(h, (; x=3.0, y=4.0, z=2.3)) == ((x = 2.3, y = 0.0, z = 3.0),)
-  @test gradient(h, Dict(:x=>3.0, :y=>4.0, :z=>2.3)) == ((y = 0.0, z = 3.0, x = 2.3),)
+  @test gradient(h, (; x=3.0, y=4.0, z=2.3)) == ((x = 2.3, y = nothing, z = 3.0),)
+  @test gradient(h, Dict(:x=>3.0, :y=>4.0, :z=>2.3)) == ((y = nothing, z = 3.0, x = 2.3),)
+
+  # for when no kwargs have grads backpropogated
+  no_kwarg_grad(x; kwargs...) = x[kwargs[:i]]
+  @test gradient(x -> no_kwarg_grad(x; i=1), [1]) == ([1],)
 end
 
 @testset "Iterators" begin
@@ -534,19 +606,17 @@ end
   end == ([1, 2 * 10^1, 3 * 100^2],)
 
   # zip
-  if VERSION >= v"1.5"
-    # On Julia 1.4 and earlier, [x/y for (x,y) in zip(10:14, 1:10)] is a DimensionMismatch,
-    # while on 1.5 - 1.7 it stops early. 
+  # On Julia 1.4 and earlier, [x/y for (x,y) in zip(10:14, 1:10)] is a DimensionMismatch,
+  # while on 1.5 - 1.7 it stops early.
 
-    @test gradient(10:14, 1:10) do xs, ys
-      sum([x/y for (x,y) in zip(xs, ys)])
-    end[2] ≈ vcat(.-(10:14) ./ (1:5).^2, zeros(5))
+  @test gradient(10:14, 1:10) do xs, ys
+    sum([x/y for (x,y) in zip(xs, ys)])
+  end[2] ≈ vcat(.-(10:14) ./ (1:5).^2, zeros(5))
 
-    @test_broken gradient(10:14, 1:10) do xs, ys
-      sum(x/y for (x,y) in zip(xs, ys))   # same without collect
-      # Here @adjoint function Iterators.Zip(xs) gets dy = (is = (nothing, nothing),)
-    end[2] ≈ vcat(.-(10:14) ./ (1:5).^2, zeros(5))
-  end
+  @test_broken gradient(10:14, 1:10) do xs, ys
+    sum(x/y for (x,y) in zip(xs, ys))   # same without collect
+    # Here @adjoint function Iterators.Zip(xs) gets dy = (is = (nothing, nothing),)
+  end[2] ≈ vcat(.-(10:14) ./ (1:5).^2, zeros(5))
 
   bk_z = pullback((xs,ys) -> sum([abs2(x*y) for (x,y) in zip(xs,ys)]), [1,2], [3im,4im])[2]
   @test bk_z(1.0)[1] isa AbstractVector{<:Real}  # projection
@@ -598,7 +668,7 @@ end
 
   # Iterators.Product with enumerate
   @test gradient([2 3; 4 5]) do xs
-    sum([x^i+y for (i,x) in enumerate(xs), y in xs]) 
+    sum([x^i+y for (i,x) in enumerate(xs), y in xs])
   end == ([8 112; 36 2004],)
 end
 
@@ -617,9 +687,8 @@ end
   end
 
   i = 1
-  global x = Any[nothing,nothing]
-
-  Zygote.@nograd g(x,i,sensealg) = Main.x[i] = sensealg
+  x = Any[nothing,nothing]
+  Zygote.@nograd g(x,i,sensealg) = x[i] = sensealg
   function f(;sensealg=nothing)
     g(x,i,sensealg)
     return rand(100)
@@ -641,13 +710,51 @@ end
   # https://github.com/FluxML/Zygote.jl/issues/599
   @test gradient(w -> sum([w...]), [1,1])[1] isa AbstractVector
 
+  # https://github.com/FluxML/Zygote.jl/issues/1417
+  # splatting an array into vcat gives it a Tuple cotangent, which the vcat rrule
+  # then projects directly via `ProjectTo{AbstractArray}`
+  function loss1417(theta)
+    x1 = vcat([theta], 5)
+    x2 = vcat(x1...)
+    return x2[1]
+  end
+  @test gradient(loss1417, 1.0) == (1.0,)
+  @test gradient(x -> sum(vcat(x...)), [1.0, 2.0, 3.0])[1] == [1.0, 1.0, 1.0]
+
   # https://github.com/FluxML/Zygote.jl/issues/866
   f866(x) = reshape(x, fill(2, 2)...)
   @test gradient(x->sum(f866(x)), rand(4))[1] == [1,1,1,1]
 
+  # https://github.com/FluxML/Zygote.jl/issues/1567
+  # reshape of a non-differentiable array gets a `nothing`/`AbstractZero` cotangent
+  @test gradient(w -> sum(w * reshape(rand(Bool, 12), 3, 4)), rand(2, 3))[1] |> size == (2, 3)
+  @test gradient(w -> sum(w * reshape(trues(6), 2, 3)), rand(4, 2))[1] |> size == (4, 2)
+
   # https://github.com/FluxML/Zygote.jl/issues/731
   f731(x) = sum([x' * x, x...])
   @test_broken gradient(f731, ones(3)) # MethodError: no method matching +(::Tuple{Float64, Float64, Float64}, ::Vector{Float64})
+
+  # https://github.com/FluxML/Zygote.jl/issues/1198
+  # Loop-carried variables that permute every iteration (a swap or rotation)
+  # used to drop the gradient (silent `nothing`): the adjoint loop swaps two
+  # block arguments per iteration, which was mis-lowered as a non-parallel copy.
+  function swap1198(x)
+    a, b = x, 2x
+    for _ in 1:3
+      a, b = b, a
+    end
+    return a
+  end
+  @test gradient(swap1198, 1.0) == (2.0,)  # 3 swaps of (x, 2x) -> returns 2x
+
+  function rotate1198(x)
+    v0, v1, v2 = x, 2x, 3x
+    for _ in 1:4
+      v0, v1, v2 = v1, v2, v0
+    end
+    return v0
+  end
+  @test gradient(rotate1198, 1.0) == (2.0,)  # 4 rotations -> v0 holds 2x
 end
 
 @testset "accumulation" begin
@@ -666,6 +773,24 @@ end
   loss(x) = sum(abs2, net(x))
   @test gradient(loss, ones(10,10))[1] == fill(131072, 10, 10)
   @test 150_000_000 > @allocated gradient(loss, ones(1000,1000))
+
+  # https://github.com/FluxML/Zygote.jl/issues/1233
+  function defensiveupdate(d, a)
+    nd = deepcopy(d)
+    nd[1] = d[1] * a
+    return nd
+  end
+  d = Dict(i => ones(1) for i in 1:2)
+  @test gradient(d) do d
+    nd = defensiveupdate(d, 5)
+    return sum(nd[1]) + sum(nd[2])
+  end[1] == Dict(1 => Fill(5, 1), 2 => Fill(1, 1))
+
+  # https://github.com/FluxML/Zygote.jl/issues/1113
+  # deepcopy of a dict constructed *inside* the differentiated function used to
+  # silently drop the gradient (the dict gradient is keyed by object identity).
+  @test gradient(x -> deepcopy(Dict(:a => x))[:a], 2.0) == (1.0,)
+  @test gradient(x -> (dc = deepcopy(Dict(:a => x, :b => 2x)); dc[:a] + 3 * dc[:b]), 2.0) == (7.0,)
 end
 
 @testset "tricky broadcasting" begin
@@ -725,4 +850,86 @@ end
   @test gradient(xs -> sum((x->x.im^2), xs), [1+2im,3])[1] == [4im, 0]
   @test gradient(xs -> sum(map(x->x.im^2, xs)), [1+2im,3])[1] == [4im, 0]
   @test gradient(xs -> mapreduce(x->x.im^2, +, xs), [1+2im,3])[1] == [4im, 0]
+end
+
+@testset "broadcast fallbacks" begin
+  # https://github.com/FluxML/Zygote.jl/issues/1359
+  struct MyFloat64 <: Number
+    n::Float64
+  end
+
+  Base.exp(f::MyFloat64) = MyFloat64(exp(f.n))
+  Base.conj(f::MyFloat64) = MyFloat64(conj(f.n))
+  Base.:*(x::MyFloat64, y::MyFloat64) = MyFloat64(x.n * y.n)
+
+  x = MyFloat64[1., 2., 3.]
+  result, pb = @inferred Zygote.pullback(Base.broadcasted, Base.Broadcast.DefaultArrayStyle{1}(), exp, x)
+  @inferred pb(MyFloat64[1., 1., 1.])
+end
+
+@testset "Dict" begin
+  # issue #717
+  @test gradient(x -> (() -> x[:y])(), Dict(:y => 0.4)) == (Dict(:y => 1.0),)
+
+  ntd = (; data = Dict("x" => rand(2)))
+  @test gradient(x -> sum(x.data["x"]), ntd)[1] == (; data = Dict("x" => ones(2)))
+
+  # issue #760
+  function f760(x)
+    d = Dict()
+    for i in 1:4
+        push!(d, i=>i^x)
+    end
+    sum(values(d))
+  end
+  @test gradient(f760, 3)[1] ≈ 123.93054835019153
+end
+
+@testset "withgradient" begin
+  @test withgradient([1,2,4]) do x
+    z = 1 ./ x
+    sum(z), z
+  end == (val = (1.75, [1.0, 0.5, 0.25]), grad = ([-1.0, -0.25, -0.0625],))
+
+  @test withgradient(3.0, 4.0) do x, y
+    (div = x/y, mul = x*y)
+  end == (val = (div = 0.75, mul = 12.0), grad = (0.25, -0.1875))
+
+  f3(x) = sum(sin, x), sum(cos, x), sum(tan, x)
+  g1 = gradient(first∘f3, [1,2,3.0])
+  y2, g2 = withgradient(first∘f3, [1,2,3.0])
+  y3, g3 = withgradient(f3, [1,2,3.0])
+  @test g1[1] ≈ g2[1] ≈ g3[1]
+end
+
+@testset "isdefined" begin
+  # `@isdefined` on a conditionally-defined local (a slot in the lowered IR) used to
+  # be mishandled: IRTools' SSA conversion substitutes the slot's value into the
+  # `isdefined` node, which both segfaults Julia 1.12 codegen (FluxML/Zygote.jl#1662)
+  # and reports "defined" even on the undefined path. Both branches must work.
+  function maybe(x)
+    local y
+    x > 0 && (y = 3x)
+    @isdefined(y) ? y * 2 : 42 * x
+  end
+  @test gradient(maybe, 2.0)[1] == 6.0    # y defined  -> d(6x)/dx
+  @test gradient(maybe, -1.0)[1] == 42.0  # y undefined -> d(42x)/dx
+end
+
+@testset "logging macros" begin
+  # A logging macro expands to branch-heavy, side-effecting code with `isdefined`
+  # assertions. Differentiating a function containing one used to segfault on Julia
+  # 1.12 (FluxML/Zygote.jl#1662). Logging should be transparent to AD.
+  Base.CoreLogging.with_logger(Base.CoreLogging.NullLogger()) do
+    warn_branch(x) = x > 0 ? x * 2 : (@warn "neg"; x)
+    @test gradient(warn_branch, 1.0f0)[1] == 2.0f0   # branch not taken (issue MWE)
+    @test gradient(warn_branch, -1.0f0)[1] == 1.0f0  # branch taken: warn executed
+
+    info_branch(x) = x > 0 ? x * 2 : (@info "neg"; x)
+    @test gradient(info_branch, -1.0f0)[1] == 1.0f0
+
+    @test gradient(x -> (@warn "always"; x^2), 3.0f0)[1] == 6.0f0
+    # a logging keyword argument that depends on the differentiated variable
+    @test gradient(x -> (@info "msg" foo=x; x^2), 2.0f0)[1] == 4.0f0
+  end
 end

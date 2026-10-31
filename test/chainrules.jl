@@ -1,5 +1,7 @@
-using ChainRulesCore, ChainRulesTestUtils, Zygote
+using ChainRulesCore
+using ChainRulesTestUtils
 using Zygote: ZygoteRuleConfig
+using LinearAlgebra
 
 @testset "ChainRules integration" begin
     @testset "ChainRules basics" begin
@@ -64,7 +66,7 @@ using Zygote: ZygoteRuleConfig
             end
             return simo(x), simo_pullback
         end
-        
+
         simo_outer(x) = sum(simo(x))
 
         simo_rrule_hitcount[] = 0
@@ -86,7 +88,7 @@ using Zygote: ZygoteRuleConfig
             end
             return miso(a, b), miso_pullback
         end
-        
+
 
         miso_outer(x) = miso(100x, 10x)
 
@@ -163,14 +165,10 @@ using Zygote: ZygoteRuleConfig
 
         @test (1,) == h(1)
 
-        if VERSION >= v"1.6-"
-            @test begin
-                a3, pb3 = Zygote.pullback(h, 1)
-                ((1,),) == pb3(1)
-            end
-        else
+
+        @test begin
             a3, pb3 = Zygote.pullback(h, 1)
-            @test ((1,),) == pb3(1)
+            ((1,),) == pb3(1)
         end
     end
 
@@ -186,7 +184,7 @@ using Zygote: ZygoteRuleConfig
             end
             return kwfoo(x; k=k), kwfoo_pullback
         end
-        
+
 
         kwfoo_outer_unused(x) = kwfoo(x)
         kwfoo_outer_used(x) = kwfoo(x; k=-15)
@@ -211,7 +209,7 @@ using Zygote: ZygoteRuleConfig
             end
             return not_diff_kw_eg(x, i; kwargs...), not_diff_kw_eg_pullback
         end
-        
+
 
         @test (nothing,) == Zygote.gradient(x->not_diff_kw_eg(x, 2), 10.4)
         @test (nothing,) == Zygote.gradient(x->not_diff_kw_eg(x, 2; kw=2.0), 10.4)
@@ -222,7 +220,7 @@ using Zygote: ZygoteRuleConfig
             x::T
         end
         StructForTestingTypeOnlyRRules() = StructForTestingTypeOnlyRRules(1.0)
-        
+
         function ChainRulesCore.rrule(P::Type{<:StructForTestingTypeOnlyRRules})
             # notice here we mess with the primal doing 2.0 rather than 1.0, this is for testing purposes
             # and also because apparently people actually want to do this. Weird, but 🤷
@@ -257,11 +255,41 @@ using Zygote: ZygoteRuleConfig
         @test ([1.0],) == Zygote.gradient(oout_id_outer, [π])
         @test oout_id_rrule_hitcount[] == 0
 
-        # Now try opting out After we have already used it 
+        # Now try opting out After we have already used it
         @opt_out ChainRulesCore.rrule(::typeof(oout_id), x::Real)
         oout_id_rrule_hitcount[] = 0
         @test (1.0,) == Zygote.gradient(oout_id_outer, π)
         @test oout_id_rrule_hitcount[] == 0
+    end
+
+    # issue #1204
+    @testset "NotImplemented" begin
+        f_notimplemented(x) = x
+        @scalar_rule f_notimplemented(x) @not_implemented("not implemented :(")
+        @test Zygote.gradient(f_notimplemented, 0.1) === (nothing,)
+        @test Zygote.gradient(x -> f_notimplemented(x[1]), 0.1) === (nothing,)
+        if isdefined(Base, :only)
+            @test Zygote.gradient(x -> f_notimplemented(only(x)), (0.1,)) === (nothing,)
+            @test Zygote.gradient(x -> f_notimplemented(only(x)), [0.1]) === (nothing,)
+        end
+    end
+
+    # https://github.com/FluxML/Zygote.jl/issues/1234
+    @testset "rrule lookup ambiguities" begin
+      @testset "unconfigured" begin
+        f_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::typeof(f_ambig), x::Int, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::typeof(f_ambig), x, y::Int) = x + y, _ -> (0, 0)
+
+        @test_throws MethodError pullback(f_ambig, 1, 2)
+      end
+      @testset "configured" begin
+        h_ambig(x, y) = x + y
+        ChainRulesCore.rrule(::ZygoteRuleConfig, ::typeof(h_ambig), x, y) = x + y, _ -> (0, 0)
+        ChainRulesCore.rrule(::RuleConfig, ::typeof(h_ambig), x::Int, y::Int) = x + y, _ -> (0, 0)
+
+        @test_throws MethodError pullback(h_ambig, 1, 2)
+      end
     end
 end
 
@@ -336,8 +364,10 @@ end
         test_rrule(ZygoteRuleConfig(), sum, cbrt, randn(5); rrule_f=rrule_via_ad)
 
         # but x -> cbrt(x) has no rule, so will be done by Zygote
-        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5))
-        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rrule_f=rrule_via_ad)
+        # increased tolerances because these are occasionally flaky at rtol=1e-9
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8)
+        test_rrule(ZygoteRuleConfig(), sum, x -> cbrt(x), randn(5); rtol=1e-8,
+                   rrule_f=rrule_via_ad)
     end
 
     # See https://github.com/FluxML/Zygote.jl/issues/1078
@@ -371,13 +401,55 @@ end
     @test @inferred(Zygote.z2d((nothing,), (1,))) === NoTangent()
     @test @inferred(Zygote.z2d((nothing, nothing), (1,2))) === NoTangent()
 
-    # To test the generic case, we need a struct within a struct. 
+    # To test the generic case, we need a struct within a struct.
     nested = Tangent{Base.RefValue{ComplexF64}}(; x=Tangent{ComplexF64}(; re=1, im=NoTangent()),)
-    if VERSION > v"1.7-"
-        @test @inferred(Zygote.z2d((; x=(; re=1)), Ref(3.0+im))) == nested
-        @test @inferred(Zygote.z2d((; x=(; re=nothing)), Ref(3.0+im))) === NoTangent()
-    else
-        @test Zygote.z2d((; x=(; re=1)), Ref(3.0+im)) == nested
-        @test Zygote.z2d((; x=(; re=nothing)), Ref(3.0+im)) === NoTangent()
+    @test @inferred(Zygote.z2d((; x=(; re=1)), Ref(3.0+im))) == nested
+    @test @inferred(Zygote.z2d((; x=(; re=nothing)), Ref(3.0+im))) === NoTangent()
+
+    x = (c = (a = randn(3,3), b = rand(3)), d = randn(5))
+    z2d_compiled = Zygote.z2d(x, x)
+    z2d_fallback = Zygote._z2d_struct_fallback(x, x)
+    @test z2d_compiled.d === z2d_fallback.d
+    @test z2d_compiled.c.a === z2d_fallback.c.a
+    @test z2d_compiled.c.b === z2d_fallback.c.b
+end
+
+@testset "ChainRules translation" begin
+    @test Zygote.wrap_chainrules_input(nothing) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input((nothing,)) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input([nothing]) == ZeroTangent()
+    @test Zygote.wrap_chainrules_input(((1.0, 2.0), 3.0)) == Tangent{Any}(Tangent{Any}(1.0, 2.0), 3.0)
+    @test Zygote.wrap_chainrules_input((; a = 1.0, b = 2.0)) == Tangent{Any}(a = 1.0, b = 2.0)
+    @test Zygote.wrap_chainrules_input(Ref(1)) == 1
+    @test Zygote.wrap_chainrules_input([2.0; 4.0]) == [2.0; 4.0]
+    @test Zygote.wrap_chainrules_input([[2.0; 4.0], [1.0; 3.0]]) == [[2.0; 4.0], [1.0; 3.0]]
+    @test Zygote.wrap_chainrules_input([nothing; 4.0]) == [0.0; 4.0] # ChainRules uses the numeric zero where possible
+end
+
+@testset "Lazy" begin
+    custom_add(x, y) = x + y
+    function ChainRulesCore.rrule(::typeof(custom_add), x, y)
+        function pullback(Δ)
+            return NoTangent(), unthunk(Δ), @thunk(error("Should not compute."))
+        end
+        custom_add(x, y), pullback
     end
+
+    x, y = 1f0, 1f0
+    Zygote.gradient(x) do x
+        sum(custom_add(x, y))
+    end
+end
+
+@testset "No thunks in the gradient" begin
+    struct CustomDense
+        w::Matrix{Float32}
+    end
+    (d::CustomDense)(x) = d.w * x
+
+    layers = [CustomDense(rand(Float32, 3, 3))]
+    x = ones(Float32, 3)
+    g = gradient(layers -> sum(layers[1](x)), layers)[1]
+    @test g[1] isa NamedTuple
+    @test g[1].w isa Array
 end

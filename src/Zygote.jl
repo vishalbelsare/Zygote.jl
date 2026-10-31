@@ -3,22 +3,26 @@ module Zygote
 using LinearAlgebra, Statistics
 using LinearAlgebra: copytri!, AbstractTriangular
 
+import ZygoteRules
 import ZygoteRules: @adjoint, @adjoint!, AContext, adjoint, _pullback, pullback,
-  literal_getproperty, literal_getfield
+  literal_getproperty, literal_getfield, unthunk_tangent
 
 using ChainRulesCore
-using ChainRules: ChainRules, rrule, unthunk, canonicalize
+using ChainRules: ChainRules, AbstractThunk, rrule, unthunk, canonicalize
 using IRTools
-using MacroTools, Requires
+using MacroTools
 using MacroTools: @forward
 
 import Distributed: pmap, CachingPool, workers
-export Params, withgradient, gradient, withjacobian, jacobian, hessian, diaghessian, pullback, pushforward, @code_adjoint
+
+export withgradient, gradient, withjacobian, jacobian, hessian, diaghessian, pullback, pushforward, @code_adjoint
 export rrule_via_ad
 
 const Numeric{T<:Number} = Union{T, AbstractArray{<:T}}
 
-include("tools/idset.jl")
+include("deprecated.jl")
+export Params
+
 include("tools/buffer.jl")
 include("tools/builtins.jl")
 
@@ -42,8 +46,7 @@ include("lib/broadcast.jl")
 include("lib/forward.jl")
 include("lib/utils.jl")
 include("lib/range.jl")
-@init @require Distances="b4f34e82-e78d-54a5-968a-f98e89d6e8f7" include("lib/distances.jl")
-@init @require LogExpFunctions="2ab3a3ac-af41-5b50-aa03-7779005ae688" include("lib/logexpfunctions.jl")
+include("lib/logexpfunctions.jl")
 
 # we need to define this late, so that the genfuncs see lib.jl
 # Move using statements out of this file to help with sysimage building
@@ -53,21 +56,15 @@ include("compiler/interface2.jl")
 
 include("profiler/Profile.jl")
 
-@init @require Tracker="9f7883ad-71c0-57eb-9f7f-b5c9e6d3789c" begin
-  include("flux.jl")
-end
-
-@init @require Colors="5ae59095-9a9b-59fe-a467-6f913c188581" begin
-  @nograd Colors.ColorTypes._parameter_upper_bound
-end
-
 using InteractiveUtils
-precompile() = Requires.@include("precompile.jl")
 
-# helps to work around 265-y issues
+# Clear Zygote's internal caches and force the pullback-generating `@generated`
+# functions to be re-run. This is needed to pick up `ChainRulesCore.rrule`s (or
+# `@adjoint`s) defined *after* a gradient has already been taken for the relevant
+# signature, since the cached generated code does not always get invalidated
+# (see https://github.com/FluxML/Zygote.jl/issues/1599).
 function refresh()
-  Requires.@include("compiler/interface2.jl")
-  precompile()
+  include(joinpath(@__DIR__, "compiler", "interface2.jl"))
   return
 end
 
@@ -79,4 +76,6 @@ macro profile(ex)
   end
 end
 
-end # module
+include("precompile.jl")
+
+end

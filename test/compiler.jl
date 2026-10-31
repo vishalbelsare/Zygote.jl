@@ -1,5 +1,5 @@
-using Zygote, Test
-using Zygote: pullback, @adjoint
+using LinearAlgebra
+using Zygote: pullback, @adjoint, Context
 
 macro test_inferred(ex)
   :(let res = nothing
@@ -11,14 +11,17 @@ macro test_inferred(ex)
   end) |> esc
 end
 
-trace_contains(st, func, file, line) = any(st) do fr
-  func in (nothing, fr.func) && endswith(String(fr.file), file) &&
-    fr.line == line
+function trace_contains(st, func, file, line)
+  any(st) do fr
+    func in (nothing, fr.func) && endswith(String(fr.file), file) && fr.line == line
+  end
 end
 
 bad(x) = x
+const bad_def_line = (@__LINE__) + 1
 @adjoint bad(x) = x, Δ -> error("bad")
 
+const bad_call_line = (@__LINE__) + 3
 function badly(x)
   x = x + 1
   x = bad(x)
@@ -30,16 +33,13 @@ y, back = pullback(badly, 2)
 @test_throws Exception back(1)
 bt = try back(1) catch e stacktrace(catch_backtrace()) end
 
-@test trace_contains(bt, nothing, "compiler.jl", 20)
-if VERSION >= v"1.6-"
-  @test_broken trace_contains(bt, :badly, "compiler.jl", 24)
-else
-  @test trace_contains(bt, :badly, "compiler.jl", 24)
-end
+@test trace_contains(bt, nothing, "compiler.jl", bad_def_line)
+@test trace_contains(bt, nothing, "compiler.jl", bad_call_line)
+# Julia 1.14 builds frames from the `DebugInfo` tree, which names this frame after the
+# `Pullback` method rather than the primal.
+@test trace_contains(bt, :badly, "compiler.jl", bad_call_line) broken=VERSION >= v"1.14-"
 
 # Type inference checks
-
-Zygote.refresh()
 
 y, back = @test_inferred pullback(*, 2, 3)
 @test_inferred(back(1))
@@ -81,10 +81,14 @@ y, back = @test_inferred pullback(((a,b),) -> a, (5, 10))
 
 # testcase for issue #808
 # testing that methods(Base.show) does not throw. Having something more specific would be too fragile
-buf = IOBuffer()
-Base.show(buf, methods(Base.show))
-str_repr = String(take!(buf))
-@test !isempty(str_repr)
+show_err = try
+  buf = IOBuffer()
+  Base.show(buf, methods(Base.show))
+  nothing
+catch ex
+  ex
+end
+@test show_err === nothing
 
 struct Funky
     x
@@ -128,7 +132,7 @@ end
   d_two = Zygote.pullback(two_svds, X)[2](Δoutput)
   d_one = Zygote.pullback(one_svd, X)[2](Δoutput)
   @test d_one == d_two
-end 
+end
 
 # this test fails if adjoint for literal_getproperty is added
 # https://github.com/FluxML/Zygote.jl/issues/922#issuecomment-804128905
@@ -157,16 +161,27 @@ function _Gaussian(suffix::Symbol)
     end
 end
 
+module MyMod
+  const C = 1
+  func(a, b) = a * b
+end
+
+@eval usesmod(x) = Base.getproperty($MyMod, :func)(x, Base.getproperty($MyMod, :C))
+
 @testset "inference for `getproperty`" begin
     Gaussian = _Gaussian(:getproperty)
     g = Gaussian(randn(3), randn(3, 3))
-    y, back = @inferred pullback(x -> x.m, g)
-    @test y == getfield(g, :m)
-    # This type instability is due to the handling of non-bitstypes in `accum_param`
-    if VERSION > v"1.7-"
-      @test Base.return_types(back, Tuple{Vector{Float64}}) == Any[Union{Tuple{Nothing}, typeof(((m = [1.0, 0.0, 0.0], P = nothing),))}]
-    end
-    @test back([1., 0, 0]) == ((m = [1.0, 0.0, 0.0], P = nothing),)
+    y_explicit, back_explicit = @inferred pullback(x -> x.m, g)
+    y_implicit, back_implicit = @inferred pullback(x -> x.m, Context{true}(nothing), g)
+    @test y_explicit == y_implicit == getfield(g, :m)
+
+    ∇args = ((m = [1.0, 0.0, 0.0], P = nothing),)
+      # This type instability is due to the handling of non-bitstypes in `accum_param`
+      @test Base.return_types(back_implicit, Tuple{Vector{Float64}}) == Any[Union{Tuple{Nothing}, typeof(∇args)}]
+      # But the same should infer if implicit parameters are disabled
+      @test Base.return_types(back_explicit, Tuple{Vector{Float64}}) == Any[typeof(∇args)]
+
+    @test back_explicit([1., 0, 0]) == back_implicit([1., 0, 0]) == ∇args
 
     Base.getproperty(g::Gaussian, s::Symbol) = 2getfield(g, s)
     y, back = pullback(x -> x.m, g)
@@ -199,7 +214,223 @@ end
     y, back = @inferred pullback(x -> x.m, g)
     @test y == getfield(g, :m)
     @test @inferred(back(1.0)) == ((m = 1.0, P = nothing),)
+
+
+    # Const properties on modules should be lowered as-is (not differentiated)
+    @test gradient(usesmod, 1)[1] == 1.0 broken=VERSION >= v"1.12"
+    @test @inferred(gradient(usesmod, 1))[1] == 1.0 broken=VERSION >= v"1.12"
+end
+
+@testset "`getproperty` generator is not compiled per field name" begin
+    Gaussian = _Gaussian(:specialization)
+    @test gradient(g -> g.m * g.P, Gaussian(2.0, 3.0))[1] == (m = 3.0, P = 2.0)
+    m = only(methods(Zygote._generate_literal_getproperty))
+    @test !any(Base.specializations(m)) do mi
+        Base.unwrap_unionall(mi.specTypes).parameters[end] <: Type{<:Val}
+    end
+end
+
+@testset "non-differentiable primitives error clearly" begin
+    # Regression: the callable pullback's non-differentiable branch referenced a
+    # stale argument name `j` (the generator stub names it `methodinstance`), so it
+    # leaked `UndefVarError: j` instead of a clear message. Introduced with the
+    # world-age generated-function rework; surfaced by #194, #252, #467, #619, #1156.
+    _, pb = Zygote._pullback(getglobal, Base.MathConstants, :eulergamma)
+    err = try; pb(1.0); nothing; catch e; e; end
+    @test err isa ErrorException
+    @test occursin("Non-differentiable function", err.msg)
+    @test !occursin("UndefVarError", err.msg)
 end
 
 # issue 897
 @test gradient(x -> sum(norm, collect(eachcol(x))), ones(3, 400))[1] ≈ fill(0.5773502691896258, 3, 400)
+
+# Tests adapted from https://github.com/dfdx/Umlaut.jl/pull/35
+@eval _has_boundscheck(x) = ifelse($(Expr(:boundscheck)), 2x, x)
+
+@testset "Meta Expr handling" begin
+  y, (dx,) = withgradient(_has_boundscheck, 1)
+  @test y == 2
+  @test dx == 2
+end
+
+# issue 1118 & 1380
+function f_1380(x)
+    if rand(Bool)
+        return x
+    else
+        return 2x
+    end
+
+    # unreachable
+    return nothing
+end
+
+@testset "unreachable block" begin
+    y, back = Zygote.pullback(f_1380, 1.)
+    # There should not be a compiler error
+    local g
+    @test_nowarn g = back(1.)
+    @test only(g) ∈ (1., 2.)
+end
+
+function throws_and_catches_if_x_negative(x,y)
+    z = x + y
+    try
+        if x < 0.
+            throw(DomainError("x is negative"))
+        end
+        z = 2z + x + y
+    catch err
+        @error "something went wrong" exception=(err,catch_backtrace())
+    end
+    return 3z
+end
+
+function try_catch_finally(cond, x)
+
+    try
+        x = 2x
+        cond && throw(DomainError())
+    catch
+        x = 2x
+    finally
+        x = 3x
+    end
+
+    x
+end
+
+function try_catch_else(cond, x)
+    x = 2x
+
+    try
+        x = 2x
+        cond && throw(nothing)
+    catch
+        x = 3x
+    else
+        x = 2x
+    end
+
+    x
+end
+
+@testset "try/catch" begin
+    @testset "happy path (nothrow)" begin
+        res, (dx,dy) = withgradient(throws_and_catches_if_x_negative, 1., 2.)
+        @test res == 3 * (2 * (1. + 2.) + 1. + 2.)
+        @test dx == 3. * (2. + 1.)
+        @test dy == 3. * (2. + 1.)
+    end
+
+    @testset "try/catch/finally" begin
+        res, (_, dx,) = withgradient(try_catch_finally, false, 1.)
+        @test res == 6.
+        @test dx == 6.
+
+        res, pull = pullback(try_catch_finally, true, 1.)
+        @test res == 12.
+        @test_throws ErrorException pull(1.)
+        err = try pull(1.) catch ex; ex end
+        @test occursin("Can't differentiate function execution in catch block", string(err))
+    end
+
+        @testset "try/catch/else" begin
+            @test Zygote.gradient(try_catch_else, false, 1.0) == (nothing, 8.0)
+            @test_throws ErrorException Zygote.gradient(try_catch_else, true, 1.0)
+        end
+
+    function foo_try(f)
+      y = 1
+      try
+        y = f()
+      catch
+        y
+      end
+      y
+    end
+
+    g, = gradient(x -> foo_try(() -> x), 1) # 1
+    @test g == 1.
+
+    vy, pull = pullback(foo_try, () -> 0//0) # bypass because of expr
+    @test vy === 1
+    @test_throws ErrorException pull(1.)
+
+    err = try pull(1.) catch ex; ex end
+    @test occursin("Can't differentiate function execution in catch block", string(err))
+end
+
+@testset "refresh" begin
+  # https://github.com/FluxML/Zygote.jl/issues/1599
+  # `Zygote.refresh()` must pick up an `rrule` defined *after* a gradient has
+  # already been computed (and cached) for the same signature.
+  function refresh1599(x::AbstractArray)
+    y = similar(x)
+    for i in eachindex(x)
+      y[i] = x[i] > 0 ? x[i]^2 : zero(eltype(x))
+    end
+    sum(y)
+  end
+
+  x = [1.7, 2.1, -1.5, -0.1, 3.1]
+  # Mutation is not differentiable, so this fails and caches the failing pullback.
+  @test_throws Exception Zygote.gradient(refresh1599, x)
+
+  function ChainRulesCore.rrule(::typeof(refresh1599), x)
+    J = [xᵢ > 0 ? 2xᵢ : zero(xᵢ) for xᵢ in x]
+    refresh1599_pullback(v) = NoTangent(), J * unthunk(v)
+    refresh1599(x), refresh1599_pullback
+  end
+
+  Zygote.refresh()
+
+  @test Zygote.gradient(refresh1599, x)[1] == [3.4, 4.2, 0.0, 0.0, 6.2]
+end
+
+# https://github.com/FluxML/Zygote.jl/issues/1680
+# On Julia 1.12+ the generators' own world doesn't see bindings defined after Zygote.
+later_helper_1680(x) = 2x
+calls_later_helper_1680(x) = later_helper_1680(x)
+
+@testset "constant globals are not tracked" begin
+  _, back = Zygote._pullback(Context(), calls_later_helper_1680, 1.0)
+  @test back.t isa Tuple{Zygote.Pullback{Tuple{typeof(later_helper_1680), Float64}}}
+end
+
+@testset "gradients through code compiled during precompilation" begin
+  mktempdir() do dir
+    mkpath(joinpath(dir, "ZygotePrecompile1680", "src"))
+    write(joinpath(dir, "ZygotePrecompile1680", "src", "ZygotePrecompile1680.jl"), """
+      module ZygotePrecompile1680
+      using Zygote
+      helper(x) = x
+      f(x) = 2 .* helper(x)
+      Zygote.gradient(x -> sum(f(x)), [1.0, 2.0])
+      end
+      """)
+    script = """
+      pushfirst!(DEPOT_PATH, $(repr(joinpath(dir, "depot"))))
+      push!(LOAD_PATH, $(repr(dir)))
+      using ZygotePrecompile1680, Zygote
+      print(Zygote.gradient(x -> sum(abs2, ZygotePrecompile1680.f(x)), [1.0, 2.0]))
+      """
+    cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
+    @test readchomp(cmd) == "([8.0, 16.0],)"
+  end
+end
+
+@testset "precompile workload covers keyword arguments and tuple loops" begin
+  script = """
+    using Zygote
+    m = only(filter(methods(Zygote._pullback)) do m
+      m.sig == Tuple{typeof(Zygote._pullback), Zygote.AContext, Any, Vararg{Any}}
+    end)
+    sigs = [Base.unwrap_unionall(mi.specTypes).parameters for mi in Base.specializations(m)]
+    print(any(p -> p[3] === typeof(Core.kwcall), sigs), " ",
+          any(p -> p[3] === typeof(iterate) && length(p) > 3 && p[4] <: Tuple, sigs))
+    """
+  cmd = `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $script`
+  @test readchomp(cmd) == "true true"
+end

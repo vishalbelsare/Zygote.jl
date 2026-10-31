@@ -1,4 +1,4 @@
-using Zygote, Test
+using LinearAlgebra
 
 D(f, x) = pushforward(f, x)(1)
 
@@ -38,8 +38,6 @@ end == 0
 
 @test D(x -> abs(x+2im), 1) == gradient(x -> abs(x+2im), 1+0im)[1]
 @test real(D(x -> abs(x+2im), 1)) == gradient(x -> abs(x+2im), 1)[1]  # ProjectTo means gradient here is real
-
-using LinearAlgebra
 
 @test D(3) do x
   A = zeros(5, 5)
